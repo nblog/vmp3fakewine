@@ -1,0 +1,113 @@
+diff --git a/InjectorCLI/ApplyHooking.cpp b/InjectorCLI/ApplyHooking.cpp
+index 013e2b1..8167580 100644
+--- a/InjectorCLI/ApplyHooking.cpp
++++ b/InjectorCLI/ApplyHooking.cpp
+@@ -72,7 +72,97 @@ t_NtQueryPerformanceCounter _NtQueryPerformanceCounter = 0;
+ t_NtResumeThread _NtResumeThread = 0;
+ t_NtOpenFile _NtOpenFile = 0;
+ t_NtCreateSection _NtCreateSection = 0;
+-t_NtMapViewOfSection _NtMapViewOfSection = 0;
++t_NtMapViewOfSection _NtMapViewOfSection = 0;
++
++void ApplyFakeWine(HANDLE hProcess) {
++    BYTE* remote_ntdll = (BYTE*)GetModuleBaseRemote(hProcess, L"ntdll.dll");
++    // check input
++    if (!remote_ntdll)
++        return;
++
++    SIZE_T readed = 0;
++    // check module's header
++    IMAGE_DOS_HEADER dos_header;
++    ReadProcessMemory(hProcess, remote_ntdll, &dos_header, sizeof(IMAGE_DOS_HEADER), &readed);
++    if (dos_header.e_magic != IMAGE_DOS_SIGNATURE)
++        return;
++
++    // check NT header
++    IMAGE_NT_HEADERS pe_header;
++    ReadProcessMemory(hProcess, (BYTE*)remote_ntdll + dos_header.e_lfanew, &pe_header, sizeof(IMAGE_NT_HEADERS), &readed);
++    if (pe_header.Signature != IMAGE_NT_SIGNATURE)
++        return;
++
++    // get the export directory
++    DWORD export_adress = pe_header.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
++    if (!export_adress)
++        return;
++
++    DWORD export_size = pe_header.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
++
++    BYTE* new_export_table = (BYTE*)VirtualAllocEx(hProcess, remote_ntdll + 0x1000000, export_size + 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
++
++    IMAGE_EXPORT_DIRECTORY export_directory;
++    ReadProcessMemory(hProcess, remote_ntdll + export_adress, &export_directory, sizeof(IMAGE_EXPORT_DIRECTORY), &readed);
++
++    BYTE* tmp_table = (BYTE*)malloc(export_size + 0x1000);
++    if (tmp_table == nullptr)return;
++
++    //copy functions table
++    BYTE* new_functions_table = new_export_table;
++    ReadProcessMemory(hProcess, remote_ntdll + export_directory.AddressOfFunctions, tmp_table, export_directory.NumberOfFunctions * sizeof(DWORD), &readed);
++    WriteProcessMemory(hProcess, new_functions_table, tmp_table, export_directory.NumberOfFunctions * sizeof(DWORD), &readed);
++    g_log.LogInfo(L"[VMPBypass] new_functions_table: %p", new_functions_table);
++
++    //copy ordinal table
++    BYTE* new_ordinal_table = new_functions_table + export_directory.NumberOfFunctions * sizeof(DWORD) + 0x100;
++    ReadProcessMemory(hProcess, remote_ntdll + export_directory.AddressOfNameOrdinals, tmp_table, export_directory.NumberOfNames * sizeof(WORD), &readed);
++    WriteProcessMemory(hProcess, new_ordinal_table, tmp_table, export_directory.NumberOfNames * sizeof(WORD), &readed);
++    g_log.LogInfo(L"[VMPBypass] new_ordinal_table: %p", new_ordinal_table);
++
++    //copy name table
++    BYTE* new_name_table = new_ordinal_table + export_directory.NumberOfNames * sizeof(WORD) + 0x100;
++    ReadProcessMemory(hProcess, remote_ntdll + export_directory.AddressOfNames, tmp_table, export_directory.NumberOfNames * sizeof(DWORD), &readed);
++    WriteProcessMemory(hProcess, new_name_table, tmp_table, export_directory.NumberOfNames * sizeof(DWORD), &readed);
++    g_log.LogInfo(L"[VMPBypass] new_name_table: %p", new_name_table);
++
++    free(tmp_table);
++    tmp_table = nullptr;
++
++    //setup new name  & name offset
++    BYTE* wine_func_addr = new_name_table + export_directory.NumberOfNames * sizeof(DWORD) + 0x100;
++    WriteProcessMemory(hProcess, wine_func_addr, "wine_get_version\x00", 17, &readed);
++    DWORD wine_func_offset = (DWORD)(wine_func_addr - remote_ntdll);
++    WriteProcessMemory(hProcess, new_name_table + export_directory.NumberOfNames * sizeof(DWORD), &wine_func_offset, 4, &readed);
++
++    //set fake ordinal
++    WORD last_ordinal = export_directory.NumberOfNames;
++    WriteProcessMemory(hProcess, new_ordinal_table + export_directory.NumberOfNames * sizeof(WORD), &last_ordinal, 2, &readed);
++
++    //set fake function offset
++    BYTE* query_information_process = reinterpret_cast<BYTE*>(GetProcAddress(hNtdll, "RtlGetCurrentPeb"));
++    DWORD function_offset = (DWORD)(query_information_process - remote_ntdll);
++    WriteProcessMemory(hProcess, new_functions_table + export_directory.NumberOfFunctions * sizeof(DWORD), &function_offset, 4, &readed);
++
++    //setup new directory
++    export_directory.NumberOfNames++;
++    export_directory.NumberOfFunctions++;
++
++    DWORD name_table_offset = (DWORD)(new_name_table - remote_ntdll);
++    export_directory.AddressOfNames = name_table_offset;
++
++    DWORD function_talble_offset = (DWORD)(new_functions_table - remote_ntdll);
++    export_directory.AddressOfFunctions = function_talble_offset;
++
++    DWORD ordinal_table_offset = (DWORD)(new_ordinal_table - remote_ntdll);
++    export_directory.AddressOfNameOrdinals = ordinal_table_offset;
++
++    //// change the offset of header data
++    DWORD old_prot;
++    VirtualProtectEx(hProcess, remote_ntdll + export_adress, sizeof(IMAGE_EXPORT_DIRECTORY), PAGE_EXECUTE_READWRITE, &old_prot);
++    WriteProcessMemory(hProcess, remote_ntdll + export_adress, &export_directory, sizeof(IMAGE_EXPORT_DIRECTORY), &readed);
++    VirtualProtectEx(hProcess, remote_ntdll + export_adress, sizeof(IMAGE_EXPORT_DIRECTORY), old_prot, &old_prot);
++}
+ 
+ bool ApplyNtdllHook(HOOK_DLL_DATA * hdd, HANDLE hProcess, BYTE * dllMemory, DWORD_PTR imageBase)
+ {
+@@ -342,6 +432,9 @@ bool ApplyNtdllHook(HOOK_DLL_DATA * hdd, HANDLE hProcess, BYTE * dllMemory, DWOR
+         g_log.LogDebug(L"ApplyNtdllHook -> Hooking NtMapViewOfSection");
+         HOOK_NATIVE(NtMapViewOfSection);
+     }
++
++
++    ApplyFakeWine(hProcess);
+ 
+     hdd->isNtdllHooked = TRUE;
+ 
